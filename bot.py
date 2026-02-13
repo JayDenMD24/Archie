@@ -1,0 +1,220 @@
+import discord
+from discord import app_commands
+from discord.ext import tasks
+import sqlite3
+import aiohttp
+import asyncio
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# === CONFIGURACIÓN ===
+STEAM_API_KEY = os.getenv('TOKEN_STEAM')
+DISCORD_TOKEN = os.getenv('TOKEN_DISCORD')
+
+class SteamAchievementBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.session = None
+
+    async def setup_hook(self):
+        conn = sqlite3.connect('achievements.db')
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS configuracion 
+                          (guild_id TEXT PRIMARY KEY, channel_id TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS usuarios 
+                          (discord_id TEXT PRIMARY KEY, steam_id_64 TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS logros_obtenidos 
+                          (steam_id_64 TEXT, appid TEXT, achievement_id TEXT, 
+                          PRIMARY KEY (steam_id_64, appid, achievement_id))''')
+        conn.commit()
+        conn.close()
+        
+        self.session = aiohttp.ClientSession()
+        self.check_achievements_loop.start()
+
+    async def on_ready(self):
+        await self.tree.sync()
+        print(f'✅ Bot conectado como {self.user}')
+
+    async def check_steam_privacy(self, steam_id_64):
+        url = f"http://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/?appid=440&key={STEAM_API_KEY}&steamid={steam_id_64}"
+        try:
+            async with self.session.get(url) as resp:
+                data = await resp.json()
+                stats = data.get('playerstats', {})
+                if not stats.get('success', False):
+                    if "Profile is not public" in stats.get('error', ""):
+                        return False, "❌ Tu perfil o juegos son **Privados**."
+                    return False, "❌ Error al verificar perfil."
+                return True, None
+        except:
+            return False, "❌ Error de conexión."
+
+    @tasks.loop(minutes=1)
+    async def check_achievements_loop(self):
+        conn = sqlite3.connect('achievements.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT discord_id, steam_id_64 FROM usuarios")
+        usuarios = cursor.fetchall()
+        
+        for discord_id, steam_id_64 in usuarios:
+            url_recent = f"http://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v0001/?key={STEAM_API_KEY}&steamid={steam_id_64}&format=json"
+            try:
+                async with self.session.get(url_recent) as resp:
+                    r_recent = await resp.json()
+                
+                games = r_recent.get('response', {}).get('games', [])
+                for juego in games:
+                    appid = str(juego['appid'])
+                    game_name = juego['name']
+                    
+                    url_ach = f"http://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/?appid={appid}&key={STEAM_API_KEY}&steamid={steam_id_64}"
+                    async with self.session.get(url_ach) as resp:
+                        r_ach = await resp.json()
+                    
+                    if r_ach.get('playerstats', {}).get('success'):
+                        logros = r_ach['playerstats'].get('achievements', [])
+                        for l in logros:
+                            if l.get('achieved') == 1:
+                                ach_id = l['apiname']
+                                cursor.execute("SELECT 1 FROM logros_obtenidos WHERE steam_id_64=? AND appid=? AND achievement_id=?", 
+                                             (steam_id_64, appid, ach_id))
+                                
+                                if cursor.fetchone() is None:
+                                    cursor.execute("INSERT INTO logros_obtenidos VALUES (?, ?, ?)", (steam_id_64, appid, ach_id))
+                                    conn.commit()
+                                    # LOG EN TERMINAL
+                                    print(f"✨ [NUEVO LOGRO] Discord ID: {discord_id} | Juego: {game_name} | ID Logro: {ach_id}")
+                                    await self.notificar_logro(discord_id, steam_id_64, appid, game_name, ach_id)
+            except Exception as e:
+                print(f"❌ Error escaneando a {steam_id_64}: {e}")
+        conn.close()
+
+    async def notificar_logro(self, discord_id, steam_id_64, appid, game_name, ach_id):
+        url_schema = f"http://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/?key={STEAM_API_KEY}&appid={appid}"
+        display_name, description, icon_url = ach_id, "", ""
+        global_percentage = None
+
+        try:
+            async with self.session.get(url_schema) as resp:
+                schema = await resp.json()
+            
+            if 'game' in schema and 'availableGameStats' in schema['game']:
+                available_ach = schema['game']['availableGameStats']['achievements']
+                for a in available_ach:
+                    if a['name'] == ach_id:
+                        display_name = a.get('displayName', ach_id)
+                        description = a.get('description', '')
+                        icon_url = a.get('icon', '')
+                        break
+            
+            url_global = f"https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/?gameid={appid}"
+            async with self.session.get(url_global) as resp:
+                res_global = await resp.json()
+                
+            if 'achievementpercentages' in res_global:
+                all_global_ach = res_global['achievementpercentages']['achievements']
+                for g_ach in all_global_ach:
+                    if g_ach['name'] == ach_id:
+                        global_percentage = round(float(g_ach.get('percent', 0)), 1)
+                        break
+        except Exception as e:
+            print(f"⚠️ Error en detalles: {e}")
+
+        # === LÓGICA DE RAREZA Y COLORES ===
+        # Escala: Azul -> Verde -> Morado -> Rojo -> Dorado
+        if global_percentage is None:
+            embed_color = discord.Color.light_grey()
+            rareza_str = "Desconocida"
+        elif global_percentage <= 2.0:
+            embed_color = discord.Color.from_rgb(255, 215, 0) # Dorado
+            rareza_str = "👑 Legendario / Ultra Raro"
+        elif global_percentage <= 10.0:
+            embed_color = discord.Color.red()
+            rareza_str = "🔴 Muy Raro"
+        elif global_percentage <= 25.0:
+            embed_color = discord.Color.purple()
+            rareza_str = "🟣 Raro"
+        elif global_percentage <= 50.0:
+            embed_color = discord.Color.green()
+            rareza_str = "🟢 Poco Común"
+        else:
+            embed_color = discord.Color.blue()
+            rareza_str = "🔵 Común"
+
+        conn = sqlite3.connect('achievements.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT channel_id FROM configuracion")
+        canales = cursor.fetchall()
+        conn.close()
+
+        for (channel_id,) in canales:
+            channel = self.get_channel(int(channel_id))
+            if channel:
+                embed = discord.Embed(
+                    title="🏆 ¡Logro Desbloqueado!",
+                    description=f"<@{discord_id}> ha ganado un logro en **{game_name}**",
+                    color=embed_color
+                )
+                embed.add_field(name="Logro", value=f"**{display_name}**", inline=True)
+                embed.add_field(name="Rareza Global", value=f"{rareza_str} ({global_percentage}%)", inline=True)
+                if description:
+                    embed.add_field(name="Descripción", value=f"*{description}*", inline=False)
+                if icon_url:
+                    embed.set_thumbnail(url=icon_url)
+                
+                try: await channel.send(embed=embed)
+                except: pass
+
+# --- COMANDOS ---
+bot = SteamAchievementBot()
+
+@bot.tree.command(name="configurar", description="Define el canal de anuncios")
+@app_commands.checks.has_permissions(administrator=True)
+async def configurar(interaction: discord.Interaction, canal: discord.TextChannel):
+    conn = sqlite3.connect('achievements.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO configuracion VALUES (?, ?)", (str(interaction.guild_id), str(canal.id)))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"✅ Canal de logros establecido en {canal.mention}")
+
+@bot.tree.command(name="vincular", description="Vincula tu SteamID64")
+async def vincular(interaction: discord.Interaction, steamid64: str):
+    await interaction.response.defer(thinking=True)
+    es_publico, msg_error = await bot.check_steam_privacy(steamid64)
+    if not es_publico:
+        await interaction.followup.send(msg_error)
+        return
+
+    conn = sqlite3.connect('achievements.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO usuarios VALUES (?, ?)", (str(interaction.user.id), steamid64))
+    
+    url_games = f"http://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/?key={STEAM_API_KEY}&steamid={steamid64}&format=json&include_played_free_games=1"
+    try:
+        async with bot.session.get(url_games) as resp:
+            r = await resp.json()
+        games = r.get('response', {}).get('games', [])
+        for g in games:
+            appid = str(g['appid'])
+            url_ach = f"http://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/?appid={appid}&key={STEAM_API_KEY}&steamid={steamid64}"
+            async with bot.session.get(url_ach) as resp:
+                res_ach = await resp.json()
+            if res_ach.get('playerstats', {}).get('success'):
+                for l in res_ach['playerstats'].get('achievements', []):
+                    if l.get('achieved') == 1:
+                        cursor.execute("INSERT OR IGNORE INTO logros_obtenidos VALUES (?, ?, ?)", (steamid64, appid, l['apiname']))
+        conn.commit()
+        await interaction.followup.send("🎮 Perfil vinculado y logros base sincronizados.")
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Vinculado con errores: {e}")
+    finally:
+        conn.close()
+
+bot.run(DISCORD_TOKEN)
