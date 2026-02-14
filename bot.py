@@ -5,8 +5,9 @@ import sqlite3
 import aiohttp
 import asyncio
 import os
+import threading
+from datetime import datetime
 from dotenv import load_dotenv
-
 load_dotenv()
 
 # === CONFIGURACIÓN ===
@@ -19,6 +20,8 @@ class SteamAchievementBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.session = None
+        self.ciclos_revisión = 0 
+        self.inicio_time = datetime.now()
 
     async def setup_hook(self):
         conn = sqlite3.connect('achievements.db')
@@ -35,10 +38,61 @@ class SteamAchievementBot(discord.Client):
         
         self.session = aiohttp.ClientSession()
         self.check_achievements_loop.start()
+        threading.Thread(target=self.consola_input, daemon=True).start()
 
     async def on_ready(self):
         await self.tree.sync()
-        print(f'✅ Bot conectado como {self.user}')
+        print(f'Bot conectado como {self.user}')
+        print("Escribe 'help' para ver la lista comandos\n")
+            # === LÓGICA DE CONSOLA ===
+    def consola_input(self):
+        MI_STEAM_ID = "76561199351482162"  
+        HK_APP_ID = "367520"
+        LOGRO_CHARMED = "CHARMED"      
+        LOGRO_ENCHANTED = "ENCHANTED"  
+
+        while True:
+            cmd = input().strip().lower()
+            
+            if cmd == "help":
+
+                print("\nstats      - Ver uptime y usuarios")
+                print("test_achie - Elimina un logro de la DB para que el bot lo detecte como nuevo")
+                print("test_msg   - Envía un mensaje de prueba a Discord")
+                print("help       - Mostrar este mensaje\n")
+            
+            elif cmd == "stats":
+                delta = datetime.now() - self.inicio_time
+                horas, resto = divmod(int(delta.total_seconds()), 3600)
+                minutos, _ = divmod(resto, 60)
+                dias, horas = divmod(horas, 24)
+
+                conn = sqlite3.connect('achievements.db')
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM usuarios")
+                total_usuarios = cursor.fetchone()[0]
+                conn.close()
+
+                print(f"\nTiempo encendido:    {dias}d {horas}h {minutos}m")
+                print(f"Ciclos de revisión:  {self.ciclos_revisión}")
+                print(f"Usuarios en DB:      {total_usuarios}\n")
+
+            elif cmd == "test_achie":
+                conn = sqlite3.connect('achievements.db')
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM logros_obtenidos WHERE steam_id_64=? AND appid=? AND achievement_id=?", 
+                              (MI_STEAM_ID, HK_APP_ID, LOGRO_CHARMED))
+                conn.commit()
+                conn.close()
+                print(f"\n[DB] Logro '{LOGRO_CHARMED}' eliminado de la DB local.")
+                print(f"El bot lo enviará automáticamente en el próximo escaneo.\n")
+
+            elif cmd == "test_msg":
+                asyncio.run_coroutine_threadsafe(
+                    self.notificar_logro("0", MI_STEAM_ID, HK_APP_ID, "Hollow Knight", LOGRO_ENCHANTED), 
+                    self.loop
+                )
+                print(f"\n[MSG] Notificación manual enviada: '{LOGRO_ENCHANTED}'\n")
 
     async def check_steam_privacy(self, steam_id_64):
         url = f"http://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/?appid=440&key={STEAM_API_KEY}&steamid={steam_id_64}"
@@ -56,6 +110,7 @@ class SteamAchievementBot(discord.Client):
 
     @tasks.loop(minutes=1)
     async def check_achievements_loop(self):
+        self.ciclos_revisión += 1
         conn = sqlite3.connect('achievements.db')
         cursor = conn.cursor()
         cursor.execute("SELECT discord_id, steam_id_64 FROM usuarios")
@@ -87,7 +142,11 @@ class SteamAchievementBot(discord.Client):
                                 if cursor.fetchone() is None:
                                     cursor.execute("INSERT INTO logros_obtenidos VALUES (?, ?, ?)", (steam_id_64, appid, ach_id))
                                     conn.commit()
-                                    print(f"✨ [NUEVO LOGRO] Steam ID: {steam_id_64} | Juego: {game_name} | Logro: {ach_id}")
+                                    ahora = datetime.now().strftime("%H:%M:%S")
+                                    print(f"[{ahora}] NUEVO LOGRO DETECTADO")
+                                    print(f"   ├ Juego: {game_name} ({appid})")
+                                    print(f"   ├ Logro: {ach_id}")
+                                    print(f"   └ Usuario: {steam_id_64}\n")
                                     await self.notificar_logro(discord_id, steam_id_64, appid, game_name, ach_id)
             except Exception as e:
                 print(f"❌ Error escaneando a {steam_id_64}: {e}")
