@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 # === CONFIGURACIÓN ===
 STEAM_API_KEY = os.getenv('TOKEN_STEAM')
 DISCORD_TOKEN = os.getenv('TOKEN_DISCORD')
@@ -49,11 +48,11 @@ class SteamAchievementBot(discord.Client):
                 stats = data.get('playerstats', {})
                 if not stats.get('success', False):
                     if "Profile is not public" in stats.get('error', ""):
-                        return False, "❌ Tu perfil o juegos son **Privados**."
+                        return False, "❌ El perfil o los juegos son **Privados**."
                     return False, "❌ Error al verificar perfil."
                 return True, None
         except:
-            return False, "❌ Error de conexión."
+            return False, "❌ Error de conexión con Steam."
 
     @tasks.loop(minutes=1)
     async def check_achievements_loop(self):
@@ -88,14 +87,22 @@ class SteamAchievementBot(discord.Client):
                                 if cursor.fetchone() is None:
                                     cursor.execute("INSERT INTO logros_obtenidos VALUES (?, ?, ?)", (steam_id_64, appid, ach_id))
                                     conn.commit()
-                                    # LOG EN TERMINAL
-                                    print(f"✨ [NUEVO LOGRO] Discord ID: {discord_id} | Juego: {game_name} | ID Logro: {ach_id}")
+                                    print(f"✨ [NUEVO LOGRO] Steam ID: {steam_id_64} | Juego: {game_name} | Logro: {ach_id}")
                                     await self.notificar_logro(discord_id, steam_id_64, appid, game_name, ach_id)
             except Exception as e:
                 print(f"❌ Error escaneando a {steam_id_64}: {e}")
         conn.close()
 
     async def notificar_logro(self, discord_id, steam_id_64, appid, game_name, ach_id):
+        # OBTENEMOS EL NOMBRE DE USUARIO DE STEAM PARA EL ANUNCIO
+        url_user = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={steam_id_64}"
+        steam_persona_name = "Usuario de Steam"
+        async with self.session.get(url_user) as resp:
+            data_user = await resp.json()
+            players = data_user.get('response', {}).get('players', [])
+            if players:
+                steam_persona_name = players[0]['personaname']
+
         url_schema = f"http://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/?key={STEAM_API_KEY}&appid={appid}"
         display_name, description, icon_url = ach_id, "", ""
         global_percentage = None
@@ -126,13 +133,12 @@ class SteamAchievementBot(discord.Client):
         except Exception as e:
             print(f"⚠️ Error en detalles: {e}")
 
-        # === LÓGICA DE RAREZA Y COLORES ===
-        # Escala: Azul -> Verde -> Morado -> Rojo -> Dorado
+        # COLORES SEGÚN RAREZA
         if global_percentage is None:
             embed_color = discord.Color.light_grey()
             rareza_str = "Desconocida"
         elif global_percentage <= 2.0:
-            embed_color = discord.Color.from_rgb(255, 215, 0) # Dorado
+            embed_color = discord.Color.from_rgb(255, 215, 0)
             rareza_str = "👑 Legendario / Ultra Raro"
         elif global_percentage <= 10.0:
             embed_color = discord.Color.red()
@@ -158,7 +164,8 @@ class SteamAchievementBot(discord.Client):
             if channel:
                 embed = discord.Embed(
                     title="🏆 ¡Logro Desbloqueado!",
-                    description=f"<@{discord_id}> ha ganado un logro en **{game_name}**",
+                    # AQUÍ EL CAMBIO: Muestra el nombre de Steam en lugar de la mención de Discord
+                    description=f"**{steam_persona_name}** ha ganado un logro en **{game_name}**",
                     color=embed_color
                 )
                 embed.add_field(name="Logro", value=f"**{display_name}**", inline=True)
@@ -187,15 +194,27 @@ async def configurar(interaction: discord.Interaction, canal: discord.TextChanne
 @bot.tree.command(name="vincular", description="Vincula tu SteamID64")
 async def vincular(interaction: discord.Interaction, steamid64: str):
     await interaction.response.defer(thinking=True)
+    
+    # Verificamos privacidad
     es_publico, msg_error = await bot.check_steam_privacy(steamid64)
     if not es_publico:
         await interaction.followup.send(msg_error)
         return
 
+    # OBTENEMOS EL NOMBRE DE STEAM PARA CONFIRMAR LA VINCULACIÓN
+    url_resumen = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={steamid64}"
+    steam_name = "Usuario desconocido"
+    async with bot.session.get(url_resumen) as resp:
+        data = await resp.json()
+        players = data.get('response', {}).get('players', [])
+        if players:
+            steam_name = players[0]['personaname']
+
     conn = sqlite3.connect('achievements.db')
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO usuarios VALUES (?, ?)", (str(interaction.user.id), steamid64))
     
+    # Sincronización base de logros ya obtenidos
     url_games = f"http://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/?key={STEAM_API_KEY}&steamid={steamid64}&format=json&include_played_free_games=1"
     try:
         async with bot.session.get(url_games) as resp:
@@ -211,7 +230,8 @@ async def vincular(interaction: discord.Interaction, steamid64: str):
                     if l.get('achieved') == 1:
                         cursor.execute("INSERT OR IGNORE INTO logros_obtenidos VALUES (?, ?, ?)", (steamid64, appid, l['apiname']))
         conn.commit()
-        await interaction.followup.send("🎮 Perfil vinculado y logros base sincronizados.")
+        # MENSAJE ACLARATORIO: Quién vinculó a quién
+        await interaction.followup.send(f"🎮 <@{interaction.user.id}> ha vinculado el perfil de **{steam_name}**.")
     except Exception as e:
         await interaction.followup.send(f"⚠️ Vinculado con errores: {e}")
     finally:
