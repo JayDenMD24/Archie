@@ -52,7 +52,14 @@ class SteamAchievementBot(discord.Client):
         LOGRO_ENCHANTED = "ENCHANTED"  
 
         while True:
-            cmd = input().strip().lower()
+            try:
+                # Intentamos leer de la consola
+                cmd = input().strip().lower()
+            except EOFError:
+                # Si estamos en un servidor sin terminal, este error saltará.
+                # Imprimimos un aviso y cerramos el hilo de la consola silenciosamente.
+                print("\n[INFO] No se detectó terminal interactiva. Consola de comandos deshabilitada.")
+                break
             
             if cmd == "help":
 
